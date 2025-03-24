@@ -1,0 +1,140 @@
+# Load Microsoft Graph module
+Import-Module Microsoft.Graph -ErrorAction Stop
+
+# Configuration
+$csvPath = "C:\Path\To\bucket-patterns.csv"  # Update CSV path
+$logFilePath = "C:\Logs\TaskProcessing.log"   # Log file path
+
+# Define bucket IDs
+$bucketNameToId = @{
+    "Security"   = "SECURITY_BUCKET_ID"      
+    "SharePoint" = "SHAREPOINT_BUCKET_ID"    
+    "Onedrive"   = "ONEDRIVE_BUCKET_ID"      
+    "Updates"    = "UPDATES_BUCKET_ID"       
+    "Meetings"   = "MEETINGS_BUCKET_ID"      
+}
+
+# Master bucket ID
+$masterBucketId = "MASTER_BUCKET_ID"
+
+# Initialize log file
+if (-not (Test-Path $logFilePath)) {
+    New-Item -Path $logFilePath -ItemType File -Force | Out-Null
+}
+
+# Logging function
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $logFilePath -Value "$timestamp - $Message"
+}
+
+# Authenticate to Microsoft Graph
+try {
+    Connect-MgGraph -Scopes "Group.ReadWrite.All, Tasks.ReadWrite" -ErrorAction Stop
+    Write-Log "Successfully authenticated to Microsoft Graph"
+}
+catch {
+    Write-Log "ERROR: Authentication failed - $_"
+    exit
+}
+
+# Load CSV patterns
+try {
+    $patternToBucketName = @{}
+    Import-Csv -Path $csvPath | ForEach-Object {
+        $patternToBucketName[$_.Pattern.Trim().ToLower()] = $_.Bucket
+    }
+    Write-Log "Loaded $($patternToBucketName.Count) patterns from CSV"
+}
+catch {
+    Write-Log "ERROR: Failed to load CSV - $_"
+    exit
+}
+
+# Function to extract pattern from title
+function Get-BucketFromTitle {
+    param([string]$Title)
+    if ($Title -match "(.*?)") {
+        $extracted = $matches[1].Trim().ToLower()
+        return $patternToBucketName[$extracted]
+    }
+    return $null
+}
+
+# Get all tasks from Master bucket
+try {
+    $tasks = Get-MgPlannerBucketTask -PlannerBucketId $masterBucketId -All
+    if (-not $tasks) {
+        Write-Log "No tasks found in the Master bucket."
+        exit
+    }
+    Write-Log "Found $($tasks.Count) tasks in Master bucket"
+}
+catch {
+    Write-Log "ERROR: Failed to fetch tasks - $_"
+    exit
+}
+
+# Parallel Processing with Jobs (What-If Mode)
+$jobList = @()
+$taskCount = 0
+
+foreach ($task in $tasks) {
+    $job = Start-Job -ScriptBlock {
+        param($task, $patternToBucketName, $bucketNameToId, $logFilePath)
+
+        function Write-Log {
+            param([string]$Message)
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Add-Content -Path $logFilePath -Value "$timestamp - $Message"
+        }
+
+        try {
+            # Extract bucket name
+            $bucketName = $null
+            if ($task.Title -match "(.*?)") {
+                $extracted = $matches[1].Trim().ToLower()
+                $bucketName = $patternToBucketName[$extracted]
+            }
+
+            if (-not $bucketName) {
+                Write-Log "SKIPPED: No pattern match for task '$($task.Title)'"
+                return
+            }
+
+            # Get target bucket ID
+            $targetBucketId = $bucketNameToId[$bucketName]
+            if (-not $targetBucketId) {
+                Write-Log "ERROR: No ID found for bucket '$bucketName'. Skipping task '$($task.Title)'."
+                return
+            }
+
+            # Fetch task details to get the ETag
+            $fullTask = Get-MgPlannerTask -PlannerTaskId $task.Id
+            $etag = $fullTask.AdditionalProperties.'@odata.etag'
+
+            # What-If Logging (Instead of Actual Update)
+            Write-Log "WHAT-IF: Task '$($task.Title)' would be moved to '$bucketName' ($targetBucketId) with ETag: $etag"
+
+            # Uncomment the line below to actually update the task in production
+            # Update-MgPlannerTask -PlannerTaskId $task.Id -BodyParameter @{ bucketId = $targetBucketId } -IfMatch $etag
+
+        }
+        catch {
+            Write-Log "ERROR: Failed to process task '$($task.Title)' - $_"
+        }
+    } -ArgumentList $task, $patternToBucketName, $bucketNameToId, $logFilePath
+
+    $jobList += $job
+    $taskCount++
+}
+
+# Wait for all jobs to complete
+Write-Log "Processing $taskCount tasks in parallel (WHAT-IF Mode)..."
+$jobList | ForEach-Object { Wait-Job $_ }
+$jobList | ForEach-Object { Remove-Job $_ }
+
+# Summary
+Write-Log "Processing complete. Check log for details: $logFilePath"
+Write-Host "Task routing simulation complete! Check log for details: $logFilePath"
